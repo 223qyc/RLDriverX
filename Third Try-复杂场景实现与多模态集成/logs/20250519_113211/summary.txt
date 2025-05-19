@@ -1,0 +1,8 @@
+Episode Summary
+==============
+
+Total Episodes: 20
+Average Reward: 12.95 ¡À 14.38
+Average Length: 65.70 ¡À 47.03
+Total Collisions: 20
+Success Rate: 0.0%

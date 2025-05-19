@@ -1,0 +1,106 @@
+{
+    "env_config": {
+        "width": 1024,
+        "height": 768,
+        "car_length": 40,
+        "car_width": 20,
+        "max_speed": 8.0,
+        "min_speed": -3.0,
+        "max_steering": 0.8,
+        "steering_ratio": 0.2,
+        "acceleration": 0.2,
+        "deceleration": 0.3,
+        "friction": 0.05,
+        "radar_rays": 16,
+        "radar_length": 200,
+        "start_position": [
+            100,
+            668
+        ],
+        "start_angle": 0.0,
+        "render_config": {
+            "visual_size": [
+                1024,
+                768
+            ],
+            "display_size": [
+                1024,
+                768
+            ],
+            "background_color": [
+                240,
+                240,
+                240
+            ],
+            "static_color": [
+                100,
+                100,
+                100
+            ],
+            "dynamic_color": [
+                150,
+                50,
+                50
+            ],
+            "target_color": [
+                0,
+                200,
+                0
+            ],
+            "target_border_color": [
+                0,
+                255,
+                0
+            ],
+            "car_color": [
+                0,
+                0,
+                255
+            ],
+            "car_border_color": [
+                50,
+                50,
+                200
+            ],
+            "radar_color": [
+                255,
+                255,
+                0
+            ],
+            "trail_color": [
+                0,
+                0,
+                150,
+                100
+            ],
+            "text_color": [
+                0,
+                0,
+                0
+            ],
+            "show_trails": true,
+            "max_trail_length": 100,
+            "grid_on": true,
+            "grid_size": 50,
+            "grid_color": [
+                200,
+                200,
+                200
+            ]
+        }
+    },
+    "agent_config": {
+        "learning_rate": 0.0003,
+        "gamma": 0.99,
+        "buffer_size": 100000,
+        "batch_size": 64,
+        "tau": 0.005,
+        "hidden_dim": 64
+    },
+    "render_resolution": [
+        1024,
+        768
+    ],
+    "fps": 30,
+    "video_quality": 95
+}

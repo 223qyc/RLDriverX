@@ -1,0 +1,36 @@
+{
+    "episode_rewards": [
+        29.359920473398674,
+        20.58597435037956,
+        29.523040458136215,
+        23.386267260655863,
+        12.63190844455606
+    ],
+    "episode_lengths": [
+        74,
+        51,
+        55,
+        53,
+        66
+    ],
+    "collision_counts": [
+        1,
+        1,
+        1,
+        1,
+        1
+    ],
+    "target_reached": [
+        false,
+        false,
+        false,
+        false,
+        false
+    ],
+    "mean_reward": 23.097422197425274,
+    "std_reward": 6.267778467039651,
+    "mean_length": 59.8,
+    "std_length": 8.795453370918409,
+    "success_rate": 0.0,
+    "mean_collisions": 1.0
+}
