@@ -1,521 +1,475 @@
-import os
-import numpy as np
-import torch
-import cv2
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+"""
+第三阶段TD3驾驶智能体训练入口
+提供完整的训练流程，包括课程学习、模型保存、可视化等功能
+"""
+
+import argparse
+from copy import deepcopy
 from datetime import datetime
 import json
-import argparse
-import time
-from src.environment.environment import CarEnvironment
+import os
+import random
+import sys
+from typing import Dict, List, Optional
+
+import cv2
+import numpy as np
+import torch
+from tqdm import tqdm
+
+# 设置项目路径，确保模块可以正确导入
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from src.agent.agent import Agent
-from src.config.environment_config import ENV_CONFIG, RENDER_CONFIG
+from src.config import AGENT_CONFIG, ENV_CONFIG, RENDER_CONFIG, TRAINING_CONFIG, clone_configs
+from src.environment.environment import CarEnvironment
 from src.utils import MetricsRecorder
 
-def train(env_config: dict = None,
-          agent_config: dict = None,
-          training_config: dict = None,
-          save_dir: str = 'logs',
-          visualize: bool = False,
-          save_video_interval: int = 100,
-          video_fps: int = 30,
-          video_quality: int = 95,
-          num_episodes: int = None,
-          max_steps: int = None,
-          eval_interval: int = None,
-          eval_episodes: int = None,
-          model_path: str = None,
-          render_resolution: tuple = (800, 600)):
-    
+
+def set_seed(seed: int) -> None:
+    """
+    设置全局随机种子，确保实验可复现
+
+    参数:
+        seed: 随机种子值
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train(
+    env_config: Optional[Dict] = None,
+    agent_config: Optional[Dict] = None,
+    training_config: Optional[Dict] = None,
+    save_dir: str = "logs",
+    visualize: bool = False,
+    model_path: Optional[str] = None,
+    seed: int = 42,
+) -> Dict:
+    """
+    主训练函数
+
+    训练流程：
+    1. 初始化环境和智能体
+    2. 进行课程学习（难度渐进增加）
+    3. 定期评估和保存模型
+    4. 记录训练指标并可视化
+
+    参数:
+        env_config: 环境配置（可选）
+        agent_config: 智能体配置（可选）
+        training_config: 训练配置（可选）
+        save_dir: 日志和模型保存目录
+        visualize: 是否生成训练视频
+        model_path: 预训练模型路径（用于继续训练）
+        seed: 随机种子
+
+    返回:
+        包含训练结果的字典
+    """
+    # 设置随机种子
+    set_seed(seed)
+
+    # 获取并合并配置
+    configs = clone_configs()
+    env_config = deepcopy(env_config or configs["env_config"])
+    user_agent_config = agent_config or {}
+    agent_config = {**configs["agent_config"], **user_agent_config}
+    training_config = {**configs["training_config"], **(training_config or {})}
+    render_config = {**configs["render_config"], **env_config.get("render_config", {})}
+    env_config["render_config"] = render_config
+
     # 创建保存目录
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_dir = os.path.join(save_dir, timestamp)
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 检查并更新渲染配置
-    if env_config is None:
-        env_config = ENV_CONFIG.copy()
-    
-    # 确保有RENDER_CONFIG
-    if 'render_config' not in env_config:
-        env_config['render_config'] = RENDER_CONFIG.copy()
-    
-    # 更新渲染分辨率
-    if render_resolution:
-        env_config['render_config'] = env_config.get('render_config', {}).copy()
-        env_config['render_config']['visual_size'] = render_resolution
-    
-    # 保存配置
-    config = {
-        'env_config': env_config,
-        'agent_config': agent_config or {},
-        'training_config': training_config or {},
-        'render_resolution': render_resolution
-    }
-    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
-    
-    # 创建环境
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(save_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # 保存配置到文件，方便后续分析
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "env_config": env_config,
+                "agent_config": agent_config,
+                "training_config": training_config,
+                "seed": seed,
+            },
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # 初始化训练环境和评估环境（分开使用避免相互影响）
     env = CarEnvironment(env_config)
-    
-    # 创建智能体
+    eval_env = CarEnvironment(env_config)
+
+    # 如果提供了预训练模型，加载并获取其配置
+    if model_path:
+        checkpoint_config = Agent.checkpoint_metadata(model_path)
+        agent_config = {**configs["agent_config"], **checkpoint_config, **user_agent_config}
+
+    # 初始化TD3智能体
     agent = Agent(
         radar_dim=env.radar_rays,
-        visual_shape=(3, 256, 256),  # 更大的视觉输入
-        action_dim=2,
-        **agent_config
+        vector_dim=env.vector_dim,
+        visual_shape=(3, env.observation_size[1], env.observation_size[0]),
+        action_dim=env.action_space.shape[0],
+        warmup_steps=training_config["warmup_steps"],
+        **agent_config,
     )
-    
-    # 加载预训练模型（如果提供）
+
+    # 如果提供了预训练模型，加载模型参数
     if model_path:
         agent.load(model_path)
-        print(f"Loaded pretrained model from: {model_path}")
-    
-    # 创建指标记录器
-    metrics_recorder = MetricsRecorder()
-    
-    # 训练参数
-    training_config = training_config or {}
-    # 命令行参数优先级高于配置文件
-    if num_episodes is not None:
-        training_config['num_episodes'] = num_episodes
-    if max_steps is not None:
-        training_config['max_steps'] = max_steps
-    if eval_interval is not None:
-        training_config['eval_interval'] = eval_interval
-    if eval_episodes is not None:
-        training_config['eval_episodes'] = eval_episodes
-        
-    num_episodes = training_config.get('num_episodes', 1000)
-    max_steps = training_config.get('max_steps', 200)
-    eval_interval = training_config.get('eval_interval', 10)
-    save_interval = training_config.get('save_interval', 100)
-    
-    # 可视化设置
-    frames_buffer = []
-    
-    # 训练记录
-    best_eval_reward = float('-inf')
-    
-    # 创建日志文件
-    log_path = os.path.join(save_dir, 'train_log.txt')
-    with open(log_path, 'w') as log_file:
-        log_file.write("Episode,Reward,Length,ValueLoss,PolicyLoss,Steps,EvalReward,Collisions,TargetReached\n")
-        
-        # 训练循环
-        for episode in tqdm(range(num_episodes), desc='训练进度'):
-            state, _ = env.reset()
-            episode_reward = 0
-            episode_length = 0
-            episode_value_loss = 0
-            episode_policy_loss = 0
-            update_count = 0
+
+    # 初始化指标记录器
+    metrics = MetricsRecorder()
+    log_path = os.path.join(run_dir, "train_log.csv")
+    best_score = (-float("inf"), -float("inf"))  # (成功率, 平均奖励)
+
+    # 创建日志文件并开始训练
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        # 写入CSV头部
+        log_file.write(
+            "episode,stage,reward,length,critic_loss,actor_loss,collision,target_reached,final_distance,min_distance,"
+            "eval_reward,eval_success_rate\n"
+        )
+
+        # 使用进度条显示训练进度
+        progress_bar = tqdm(range(training_config["num_episodes"]), desc="训练中")
+
+        for episode in progress_bar:
+            metrics.start_episode()
+
+            # 根据课程学习计划确定当前难度阶段
+            stage_id = resolve_stage(episode, training_config["curriculum_schedule"])
+
+            # 重置环境，设置对应的课程阶段
+            state, info = env.reset(options={"curriculum_stage": stage_id})
+            episode_reward = 0.0
+            critic_losses: List[float] = []
+            actor_losses: List[float] = []
             collision_count = 0
-            target_reached = False
-            
-            for step in range(max_steps):
-                # 选择动作
+
+            # 判断是否需要录制本回合视频
+            capture_video = visualize and ((episode + 1) % training_config["video_interval"] == 0)
+            frames = []
+            final_info = info
+
+            # 执行回合
+            for _ in range(training_config["max_steps"]):
+                # 选择动作（训练模式下会添加探索噪声）
                 action = agent.select_action(state)
-                
-                # 执行动作
-                next_state, reward, done, truncated, info = env.step(action)
-                
-                # 记录步级指标
-                metrics_recorder.add_step_data(
-                    reward=reward,
-                    distance=info['distance_to_target'],
-                    speed=info['car_speed'],
-                    rotation=info['car_steering']
-                )
-                
-                # 统计碰撞
-                if info.get('collision', False):
-                    collision_count += 1
-                
-                # 检查是否到达目标
-                if info.get('target_reached', False):
-                    target_reached = True
-                
-                # 保存可视化帧
-                if visualize and episode % save_video_interval == 0:
-                    frame = env.render()
-                    # 添加信息显示
-                    frame = add_info_to_frame(
-                        frame, 
-                        episode_reward, 
-                        step + 1, 
-                        action, 
-                        info['distance_to_target'],
-                        info.get('car_speed', 0),
-                        info.get('car_steering', 0),
-                        info.get('rotation_penalty', False)
-                    )
-                    
-                    # 调整帧大小以匹配渲染分辨率
-                    if render_resolution:
-                        try:
-                            if frame is not None and frame.size > 0:
-                                frame = cv2.resize(frame, render_resolution, interpolation=cv2.INTER_AREA)
-                        except Exception as e:
-                            print(f"警告: 调整帧大小时出错: {e}")
-                    
-                    frames_buffer.append(frame)
-                
-                # 存储经验
-                agent.replay_buffer.push(state, action, reward, next_state, done)
-                
-                # 更新网络
-                value_loss, policy_loss = agent.update()
-                
-                # 更新状态
-                state = next_state
+
+                # 执行动作，获取下一状态和奖励
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                final_info = info
+
+                # 记录奖励并存储经验到回放池
+                metrics.add_step_reward(reward)
+                agent.replay_buffer.push(state, action, reward, next_state, float(terminated))
+
+                # 当回放池有足够数据且预热完成后，执行学习更新
+                if len(agent.replay_buffer) >= agent.batch_size and agent.total_steps >= agent.warmup_steps:
+                    for _ in range(training_config["updates_per_step"]):
+                        critic_loss, actor_loss = agent.update()
+                        if critic_loss is not None:
+                            critic_losses.append(critic_loss)
+                        if actor_loss is not None:
+                            actor_losses.append(actor_loss)
+
+                # 如果需要录制视频，保存当前帧
+                if capture_video:
+                    frame_info = dict(info)
+                    frame_info["episode_reward"] = episode_reward + reward
+                    frames.append(env.render(frame_info))
+
+                # 更新累计奖励和碰撞计数
                 episode_reward += reward
-                episode_length += 1
-                
-                # 记录损失
-                if value_loss is not None:
-                    episode_value_loss += value_loss
-                    episode_policy_loss += policy_loss
-                    update_count += 1
-                
-                if done or truncated:
+                if info["collision"]:
+                    collision_count += 1
+
+                # 更新状态，检查是否结束
+                state = next_state
+                if done:
                     break
-            
+
             # 计算平均损失
-            avg_value_loss = episode_value_loss / update_count if update_count > 0 else 0
-            avg_policy_loss = episode_policy_loss / update_count if update_count > 0 else 0
-            
-            # 记录回合指标
-            metrics_recorder.add_episode_data(
+            avg_critic_loss = float(np.mean(critic_losses)) if critic_losses else None
+            avg_actor_loss = float(np.mean(actor_losses)) if actor_losses else None
+
+            # 记录回合数据
+            metrics.add_episode_data(
                 reward=episode_reward,
-                length=episode_length,
-                value_loss=avg_value_loss,
-                policy_loss=avg_policy_loss,
+                length=final_info["step"],
+                critic_loss=avg_critic_loss,
+                actor_loss=avg_actor_loss,
                 collisions=collision_count,
-                target_reached=target_reached
+                target_reached=final_info["target_reached"],
+                final_distance=final_info["distance_to_target"],
+                min_distance=final_info["min_distance_to_target"],
+                stage_id=stage_id,
             )
-            
-            # 保存训练视频
-            if visualize and episode % save_video_interval == 0 and frames_buffer:
-                video_path = os.path.join(save_dir, f'train_episode_{episode + 1}.mp4')
-                save_video(frames_buffer, video_path, video_fps, video_quality)
-                frames_buffer = []  # 清空缓冲区
-            
-            # 控制台输出
-            print(f"\n[Episode {episode+1:04d}/{num_episodes}]")
-            print(f"  Reward: {episode_reward:.2f}")
-            print(f"  Length: {episode_length}")
-            print(f"  Steps: {step+1}/{max_steps}")
-            print(f"  Value Loss: {avg_value_loss:.4f}")
-            print(f"  Policy Loss: {avg_policy_loss:.4f}")
-            print(f"  Collisions: {collision_count}")
-            print(f"  Target Reached: {'Yes' if target_reached else 'No'}")
-            print(f"  Buffer Size: {len(agent.replay_buffer)}")
-            
-            # 评估
-            eval_reward = 0
-            if (episode + 1) % eval_interval == 0:
-                print(f"  [Eval] Starting evaluation...")
-                eval_reward = evaluate(env, agent)
-                print(f"  [Eval] Reward: {eval_reward:.2f}")
-                
-                # 保存最佳模型
-                if eval_reward > best_eval_reward:
-                    best_eval_reward = eval_reward
-                    agent.save(os.path.join(save_dir, 'best_model.pt'))
-                    print(f"  [New Best] Saved best model with eval reward: {eval_reward:.2f}")
-            
-            # 定期保存模型
-            if (episode + 1) % save_interval == 0:
-                agent.save(os.path.join(save_dir, f'model_episode_{episode + 1}.pt'))
-                print(f"  [Save] Saved model at episode {episode + 1}")
-                
-                # 保存并绘制当前指标
-                metrics_recorder.save_metrics(os.path.join(save_dir, 'metrics'))
-                metrics_recorder.plot_metrics(os.path.join(save_dir, 'plots'))
-                
-                # 创建热图
-                env.visualizer.create_heatmap(os.path.join(save_dir, f'heatmap_episode_{episode + 1}.png'))
-            
-            # 写入日志
-            log_file.write(f"{episode+1},{episode_reward:.2f},{episode_length},{avg_value_loss:.4f},"
-                          f"{avg_policy_loss:.4f},{step+1},{eval_reward if (episode + 1) % eval_interval == 0 else ''},"
-                          f"{collision_count},{target_reached}\n")
+
+            # 定期执行评估
+            eval_stats = None
+            if (episode + 1) % training_config["eval_interval"] == 0:
+                eval_stats = evaluate(
+                    env=eval_env,
+                    agent=agent,
+                    stage_id=stage_id,
+                    num_episodes=training_config["eval_episodes"],
+                    max_steps=training_config["max_steps"],
+                )
+
+                # 如果评估结果更好，保存为最佳模型
+                candidate_score = (eval_stats["success_rate"], eval_stats["mean_reward"])
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    agent.save(os.path.join(run_dir, "best_model.pt"))
+
+            # 如果需要，保存训练视频
+            if capture_video and frames:
+                save_video(frames, os.path.join(run_dir, f"train_episode_{episode + 1}.mp4"))
+
+            # 定期保存模型和指标
+            if (episode + 1) % training_config["save_interval"] == 0:
+                agent.save(os.path.join(run_dir, f"checkpoint_episode_{episode + 1}.pt"))
+                metrics.save_metrics(os.path.join(run_dir, "metrics"))
+                metrics.plot_metrics(os.path.join(run_dir, "plots"))
+
+            # 更新进度条显示
+            progress_bar.set_postfix(
+                stage=stage_id,
+                reward=f"{episode_reward:.1f}",
+                success=int(final_info["target_reached"]),
+                distance=f"{final_info['distance_to_target']:.1f}",
+            )
+
+            # 写入日志行
+            eval_reward_text = ""
+            eval_success_text = ""
+            if eval_stats is not None:
+                eval_reward_text = f"{eval_stats['mean_reward']:.4f}"
+                eval_success_text = f"{eval_stats['success_rate']:.4f}"
+
+            log_file.write(
+                f"{episode + 1},{stage_id},{episode_reward:.4f},{final_info['step']},{avg_critic_loss or 0.0:.6f},"
+                f"{avg_actor_loss or 0.0:.6f},{collision_count},{final_info['target_reached']},"
+                f"{final_info['distance_to_target']:.4f},{final_info['min_distance_to_target']:.4f},"
+                f"{eval_reward_text},{eval_success_text}\n"
+            )
             log_file.flush()
-    
-    # 保存最终模型和指标
-    agent.save(os.path.join(save_dir, 'final_model.pt'))
-    metrics_recorder.save_metrics(os.path.join(save_dir, 'final_metrics'))
-    metrics_recorder.plot_metrics(os.path.join(save_dir, 'final_plots'))
-    
-    # 创建热图
-    env.visualizer.create_heatmap(os.path.join(save_dir, 'final_heatmap.png'))
-    
-    # 创建训练总结
+
+    # 训练完成，保存最终模型和指标
+    agent.save(os.path.join(run_dir, "final_model.pt"))
+    metrics_payload = metrics.save_metrics(os.path.join(run_dir, "final_metrics"))
+    metrics.plot_metrics(os.path.join(run_dir, "final_plots"))
+
+    # 生成可视化总结
+    env.visualizer.create_heatmap(os.path.join(run_dir, "final_heatmap.png"))
     env.visualizer.create_episode_summary(
-        rewards=metrics_recorder.episode_rewards,
-        lengths=metrics_recorder.episode_lengths,
-        collision_counts=metrics_recorder.collision_counts,
-        target_reached=metrics_recorder.target_reached,
-        save_dir=save_dir
+        rewards=metrics.episode_rewards,
+        lengths=metrics.episode_lengths,
+        collision_counts=metrics.collision_counts,
+        target_reached=metrics.target_reached,
+        save_dir=run_dir,
     )
-    
-    print(f"\nTraining completed. Best eval reward: {best_eval_reward:.2f}")
-    print(f"Final metrics saved to: {os.path.join(save_dir, 'final_metrics')}")
-    print(f"Final plots saved to: {os.path.join(save_dir, 'final_plots')}")
-    
-    return agent, best_eval_reward
+    write_summary(run_dir, metrics_payload["summary"])
 
-def evaluate(env, agent, num_episodes=5, max_steps=500):
-    eval_rewards = []
-    print(f"    Running {num_episodes} evaluation episodes...")
-    
-    for i in range(num_episodes):
-        state, _ = env.reset()
-        episode_reward = 0
-        done = False
-        step_count = 0
-        
-        while not done and step_count < max_steps:
+    return {
+        "run_dir": run_dir,
+        "metrics": metrics_payload,
+        "best_score": best_score,
+    }
+
+
+def evaluate(
+    env: CarEnvironment,
+    agent: Agent,
+    stage_id: int,
+    num_episodes: int,
+    max_steps: int,
+) -> Dict[str, float]:
+    """
+    评估智能体性能
+
+    在无探索噪声的情况下测试智能体的表现
+
+    参数:
+        env: 评估环境
+        agent: 待评估的智能体
+        stage_id: 课程学习阶段
+        num_episodes: 评估回合数
+        max_steps: 每回合最大步数
+
+    返回:
+        包含评估指标的字典
+    """
+    rewards = []
+    lengths = []
+    successes = []
+    final_distances = []
+
+    for _ in range(num_episodes):
+        state, info = env.reset(options={"curriculum_stage": stage_id})
+        episode_reward = 0.0
+        final_info = info
+
+        # 执行回合，使用评估模式（无探索噪声）
+        for _ in range(max_steps):
             action = agent.select_action(state, evaluate=True)
-            state, reward, done, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
-            done = done or truncated
-            step_count += 1
-        
-        eval_rewards.append(episode_reward)
-        print(f"    Eval episode {i+1}/{num_episodes}: Reward = {episode_reward:.2f}, Steps = {step_count}")
-    
-    mean_reward = np.mean(eval_rewards)
-    std_reward = np.std(eval_rewards)
-    print(f"    Evaluation complete. Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
-    return mean_reward
+            final_info = info
+            state = next_state
+            if terminated or truncated:
+                break
 
-def add_info_to_frame(frame, reward, length, action, distance, speed, steering, rotation_penalty):
-    """在帧上添加信息显示"""
-    try:
-        # 确保帧有效
-        if frame is None or frame.size == 0:
-            # 创建一个空白帧
-            frame = np.ones((600, 800, 3), dtype=np.uint8) * 220
-            
-        # 检查帧的形状和类型
-        if len(frame.shape) != 3 or frame.shape[2] != 3:
-            # 转换为三通道图像
-            if len(frame.shape) == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            else:
-                # 创建一个空白帧
-                frame = np.ones((600, 800, 3), dtype=np.uint8) * 220
-                
-        # 确保数据类型为uint8
-        if frame.dtype != np.uint8:
-            frame = frame.astype(np.uint8)
-        
-        # 创建信息显示区域
-        frame_width = frame.shape[1]
-        info_height = max(100, int(frame.shape[0] * 0.15))  # 根据帧高度动态调整信息区高度
-        info_frame = np.ones((info_height, frame_width, 3), dtype=np.uint8) * 240
-        
-        # 计算字体大小和线宽（根据帧宽度调整）
-        font_scale = max(0.6, min(1.0, frame_width / 800))
-        line_thickness = max(1, int(font_scale * 2))
-        
-        # 添加文本信息 - 左边显示奖励和步数
-        cv2.putText(info_frame, f"奖励: {reward:.2f}", (20, int(info_height*0.3)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        cv2.putText(info_frame, f"步数: {length}", (20, int(info_height*0.7)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        
-        # 中间显示动作和距离
-        mid_x = int(frame_width * 0.35)
-        cv2.putText(info_frame, f"动作: [{action[0]:.2f}, {action[1]:.2f}]", (mid_x, int(info_height*0.3)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        cv2.putText(info_frame, f"目标距离: {distance:.2f}", (mid_x, int(info_height*0.7)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        
-        # 右边显示速度和转向状态
-        status_x = int(frame_width * 0.7)
-        cv2.putText(info_frame, f"速度: {speed:.2f}", (status_x, int(info_height*0.3)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        
-        # 旋转惩罚状态
-        cv2.putText(info_frame, "转向:", (status_x, int(info_height*0.7)),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), line_thickness)
-        rotation_color = (0, 0, 255) if rotation_penalty else (0, 255, 0)
-        indicator_radius = max(5, int(font_scale * 8))
-        indicator_x = status_x + int(font_scale * 120)
-        cv2.circle(info_frame, (indicator_x, int(info_height*0.65)), indicator_radius, rotation_color, -1)
-        
-        # 结合帧和信息区域
-        result = np.vstack([frame, info_frame])
-        
-        # 添加边框
-        cv2.rectangle(result, (0, 0), (result.shape[1]-1, result.shape[0]-1), (0, 0, 0), line_thickness)
-        
-        return result
-    except Exception as e:
-        print(f"  警告: 添加信息到帧时出错: {e}")
-        # 返回原始帧
-        return frame
+        # 记录结果
+        rewards.append(episode_reward)
+        lengths.append(final_info["step"])
+        successes.append(bool(final_info["target_reached"]))
+        final_distances.append(float(final_info["distance_to_target"]))
 
-def save_video(frames, path, fps=30, quality=95):
-    """保存视频，使用高质量设置"""
+    # 计算统计指标
+    return {
+        "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+        "std_reward": float(np.std(rewards)) if len(rewards) > 1 else 0.0,
+        "mean_length": float(np.mean(lengths)) if lengths else 0.0,
+        "success_rate": float(np.mean(successes)) if successes else 0.0,
+        "mean_final_distance": float(np.mean(final_distances)) if final_distances else 0.0,
+    }
+
+
+def resolve_stage(episode: int, schedule: List[Dict]) -> int:
+    """
+    根据回合数解析课程学习阶段
+
+    课程学习：难度随训练进度逐渐增加
+    从简单的固定目标、无障碍物场景逐步过渡到复杂的动态环境
+
+    参数:
+        episode: 当前回合数
+        schedule: 课程学习计划
+
+    返回:
+        当前应该使用的难度阶段ID
+    """
+    stage_id = 0
+    for item in schedule:
+        if episode >= item["episode"]:
+            stage_id = item["stage"]
+    return stage_id
+
+
+def save_video(frames: List[np.ndarray], path: str, fps: int = 30) -> None:
+    """
+    保存视频文件
+
+    参数:
+        frames: 视频帧列表
+        path: 保存路径
+        fps: 帧率
+    """
     if not frames:
-        print("  警告: 没有帧可以保存")
         return
-    
-    try:
-        # 确保所有帧大小一致
-        first_frame = frames[0]
-        if first_frame is None or first_frame.size == 0:
-            print("  警告: 第一帧无效，无法保存视频")
-            return
-            
-        height, width = first_frame.shape[:2]
-        
-        # 确保所有帧的大小都匹配
-        valid_frames = []
-        for i, frame in enumerate(frames):
-            if frame is None or frame.size == 0:
-                print(f"  警告: 跳过第{i+1}帧 (无效)")
-                continue
-                
-            if frame.shape[:2] != (height, width):
-                try:
-                    # 调整大小
-                    frame = cv2.resize(frame, (width, height))
-                except Exception as e:
-                    print(f"  警告: 跳过第{i+1}帧 (无法调整大小: {e})")
-                    continue
-                    
-            # 确保是3通道 uint8 类型
-            if len(frame.shape) != 3 or frame.shape[2] != 3:
-                try:
-                    if len(frame.shape) == 2:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                except Exception as e:
-                    print(f"  警告: 跳过第{i+1}帧 (无法转换颜色: {e})")
-                    continue
-                    
-            if frame.dtype != np.uint8:
-                try:
-                    frame = frame.astype(np.uint8)
-                except Exception as e:
-                    print(f"  警告: 跳过第{i+1}帧 (无法转换数据类型: {e})")
-                    continue
-                
-            valid_frames.append(frame)
-        
-        if not valid_frames:
-            print("  警告: 处理后没有有效帧，无法保存视频")
-            return
-            
-        # 创建视频
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(path, fourcc, fps, (width, height))
-        
-        # 写入帧
-        for frame in valid_frames:
-            out.write(frame)
-        
-        # 释放资源
-        out.release()
-        
-        print(f"  成功保存视频，包含 {len(valid_frames)} 帧，分辨率: {width}x{height}")
-    except Exception as e:
-        print(f"  错误: 保存视频时发生异常: {e}")
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    for frame in frames:
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
+        writer.write(frame.astype(np.uint8))
+    writer.release()
 
-if __name__ == '__main__':
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='训练自动驾驶智能体')
-    
-    # 训练参数
-    parser.add_argument('--num_episodes', type=int, default=1000,
-                      help='训练的总回合数')
-    parser.add_argument('--max_steps', type=int, default=500,
-                      help='每个回合的最大步数')
-    parser.add_argument('--eval_interval', type=int, default=10,
-                      help='评估间隔（回合数）')
-    parser.add_argument('--eval_episodes', type=int, default=5,
-                      help='每次评估的回合数')
-    parser.add_argument('--save_interval', type=int, default=100,
-                      help='模型保存间隔（回合数）')
-    
-    # 模型参数
-    parser.add_argument('--learning_rate', type=float, default=3e-4,
-                      help='学习率')
-    parser.add_argument('--gamma', type=float, default=0.99,
-                      help='折扣因子')
-    parser.add_argument('--buffer_size', type=int, default=100000,
-                      help='经验回放缓冲区大小')
-    parser.add_argument('--batch_size', type=int, default=64,
-                      help='批量大小')
-    parser.add_argument('--tau', type=float, default=0.005,
-                      help='目标网络软更新系数')
-    parser.add_argument('--hidden_dim', type=int, default=64,
-                      help='隐藏层维度')
-                      
-    # 其他参数
-    parser.add_argument('--env_config', type=str, default=None,
-                      help='环境配置文件路径')
-    parser.add_argument('--save_dir', type=str, default='logs',
-                      help='保存模型和日志的目录')
-    parser.add_argument('--model_path', type=str, default=None,
-                      help='预训练模型路径')
-    parser.add_argument('--render', action='store_true',
-                      help='是否渲染环境')
-    parser.add_argument('--render_interval', type=int, default=10,
-                      help='渲染间隔（回合数）')
-    parser.add_argument('--save_video', action='store_true',
-                      help='是否保存视频')
-    parser.add_argument('--video_interval', type=int, default=100,
-                      help='保存视频的间隔（回合数）')
-    parser.add_argument('--render_width', type=int, default=800,
-                      help='渲染宽度')
-    parser.add_argument('--render_height', type=int, default=600,
-                      help='渲染高度')
-    
-    # 解析参数
-    args = parser.parse_args()
-    
-    # 加载环境配置
-    env_config = ENV_CONFIG
-    if args.env_config:
-        with open(args.env_config, 'r') as f:
-            env_config = json.load(f)
-    
-    # 智能体配置
+
+def write_summary(save_dir: str, summary: Dict) -> None:
+    """
+    写入训练总结文本文件
+
+    参数:
+        save_dir: 保存目录
+        summary: 总结数据字典
+    """
+    with open(os.path.join(save_dir, "summary.txt"), "w", encoding="utf-8") as handle:
+        handle.write("训练总结\n")
+        handle.write("================\n\n")
+        handle.write(f"平均奖励: {summary['mean_reward']:.2f}\n")
+        handle.write(f"奖励标准差: {summary['std_reward']:.2f}\n")
+        handle.write(f"平均回合长度: {summary['mean_length']:.2f}\n")
+        handle.write(f"平均最终距离: {summary['mean_final_distance']:.2f}\n")
+        handle.write(f"平均最小距离: {summary['mean_min_distance']:.2f}\n")
+        handle.write(f"成功率: {summary['success_rate'] * 100:.1f}%\n")
+        handle.write(f"总碰撞次数: {summary['total_collisions']}\n")
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    解析命令行参数
+
+    支持自定义训练参数，方便进行实验调参
+    """
+    parser = argparse.ArgumentParser(description="训练第三阶段TD3智能体")
+    parser.add_argument("--num_episodes", type=int, default=TRAINING_CONFIG["num_episodes"])
+    parser.add_argument("--max_steps", type=int, default=TRAINING_CONFIG["max_steps"])
+    parser.add_argument("--eval_interval", type=int, default=TRAINING_CONFIG["eval_interval"])
+    parser.add_argument("--eval_episodes", type=int, default=TRAINING_CONFIG["eval_episodes"])
+    parser.add_argument("--save_interval", type=int, default=TRAINING_CONFIG["save_interval"])
+    parser.add_argument("--video_interval", type=int, default=TRAINING_CONFIG["video_interval"])
+    parser.add_argument("--warmup_steps", type=int, default=TRAINING_CONFIG["warmup_steps"])
+    parser.add_argument("--updates_per_step", type=int, default=TRAINING_CONFIG["updates_per_step"])
+    parser.add_argument("--save_dir", type=str, default="logs")
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--disable_visual", action="store_true")
+    parser.add_argument("--learning_rate", type=float, default=AGENT_CONFIG["learning_rate"])
+    parser.add_argument("--batch_size", type=int, default=AGENT_CONFIG["batch_size"])
+    parser.add_argument("--hidden_dim", type=int, default=AGENT_CONFIG["hidden_dim"])
+    parser.add_argument("--buffer_size", type=int, default=AGENT_CONFIG["buffer_size"])
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # 构建配置字典
+    env_config = deepcopy(ENV_CONFIG)
+    env_config["render_config"] = deepcopy(RENDER_CONFIG)
+
     agent_config = {
-        'learning_rate': args.learning_rate,
-        'gamma': args.gamma,
-        'buffer_size': args.buffer_size,
-        'batch_size': args.batch_size,
-        'tau': args.tau,
-        'hidden_dim': args.hidden_dim
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "hidden_dim": args.hidden_dim,
+        "buffer_size": args.buffer_size,
+        "use_visual": not args.disable_visual,
     }
-    
-    # 渲染配置
-    render_config = {
-        'render': args.render,
-        'render_interval': args.render_interval,
-        'save_video': args.save_video,
-        'video_interval': args.video_interval,
-        'render_resolution': (args.render_width, args.render_height)
+
+    training_config = {
+        "num_episodes": args.num_episodes,
+        "max_steps": args.max_steps,
+        "eval_interval": args.eval_interval,
+        "eval_episodes": args.eval_episodes,
+        "save_interval": args.save_interval,
+        "video_interval": args.video_interval,
+        "warmup_steps": args.warmup_steps,
+        "updates_per_step": args.updates_per_step,
+        "curriculum_schedule": deepcopy(TRAINING_CONFIG["curriculum_schedule"]),
     }
-    
-    # 运行训练
+
+    # 开始训练
     train(
         env_config=env_config,
         agent_config=agent_config,
-        num_episodes=args.num_episodes,
-        max_steps=args.max_steps,
-        eval_interval=args.eval_interval,
-        eval_episodes=args.eval_episodes,
+        training_config=training_config,
         save_dir=args.save_dir,
-        model_path=args.model_path,
         visualize=args.render,
-        save_video_interval=args.video_interval,
-        render_resolution=(args.render_width, args.render_height)
-    ) 
+        model_path=args.model_path,
+        seed=args.seed,
+    )
